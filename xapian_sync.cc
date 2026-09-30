@@ -19,6 +19,7 @@ using namespace std;
 // XXX - these things have to match notmuch-private.h
 constexpr int NOTMUCH_VALUE_TIMESTAMP = 0;
 constexpr int NOTMUCH_VALUE_MESSAGE_ID = 1;
+constexpr int NOTMUCH_VALUE_LAST_MOD = 4;
 const string notmuch_ghost_term = "Tghost";
 const string notmuch_tag_prefix = "K";
 const string notmuch_directory_prefix = "XDIRECTORY";
@@ -205,6 +206,8 @@ static void
 xapian_scan_message_ids (sqlite3 *sqldb, const writestamp &ws,
 			 Xapian::Database xdb)
 {
+  // Deleted messages have no lastmod value to scan, so flag their
+  // directories before deleting their file records.
   sqlstmt_t
     scan(sqldb,
 	  "SELECT message_id, docid FROM message_ids ORDER BY docid ASC;"),
@@ -213,7 +216,10 @@ xapian_scan_message_ids (sqlite3 *sqldb, const writestamp &ws,
 		" VALUES (?, ?, %lld, %lld);", ws.first, ws.second),
     flag_new_message(sqldb, "INSERT INTO modified_docids (docid, new)"
 		     " VALUES (?, 1);"),
-    del_message(sqldb, "DELETE FROM message_ids WHERE docid = ?;");
+    del_message(sqldb, "DELETE FROM message_ids WHERE docid = ?;"),
+    flag_message_dirs(sqldb, "INSERT OR IGNORE INTO modified_xapian_dirs"
+		      " SELECT DISTINCT dir_docid FROM xapian_files"
+		      " WHERE docid = ?;");
 
   Xapian::PostingIterator
     gi = xdb.postlist_begin(notmuch_ghost_term),
@@ -228,7 +234,8 @@ xapian_scan_message_ids (sqlite3 *sqldb, const writestamp &ws,
      [] (sqlstmt_t &s, Xapian::ValueIterator &vi) -> int {
        return s.integer(1) - vi.get_docid();
      },
-     [&add_message,&del_message,&flag_new_message,&gi,&ge,&ve]
+     [&add_message,&del_message,&flag_new_message,&flag_message_dirs,
+      &gi,&ge,&ve]
      (sqlstmt_t *sp, Xapian::ValueIterator *vip) {
        if (vip) {
 	 while (gi != ge && *gi < vip->get_docid())
@@ -244,8 +251,10 @@ xapian_scan_message_ids (sqlite3 *sqldb, const writestamp &ws,
 	 add_message.reset().param(**vip, docid).step();
 	 flag_new_message.reset().param(docid).step();
        }
-       else if (!vip)
+       else if (!vip) {
+	 flag_message_dirs.reset().param(sp->value(1)).step();
 	 del_message.reset().param(sp->value(1)).step();
+       }
        else if (sp->str(0) != **vip) {
 	 // This should be really unusual
 	 cerr << "warning: message id changed from <"
@@ -280,7 +289,8 @@ xapian_scan_directories (sqlite3 *sqldb, Xapian::Database &xdb)
     adddir(sqldb, "INSERT INTO xapian_dirs (dir_path, dir_docid, dir_mtime)"
 	   " VALUES (?, ?, ?);"),
     upddir(sqldb, "UPDATE xapian_dirs SET dir_mtime = ? WHERE dir_docid = ?;"),
-    flagdir(sqldb, "INSERT INTO modified_xapian_dirs (dir_docid) VALUES (?);");
+    flagdir(sqldb, "INSERT OR IGNORE INTO modified_xapian_dirs (dir_docid)"
+	    " VALUES (?);");
 
 
   Xapian::TermIterator
@@ -336,6 +346,58 @@ xapian_scan_directories (sqlite3 *sqldb, Xapian::Database &xdb)
     ++ti;
     scandirs.step();
   }
+}
+
+/* notmuch only records a directory's mtime in "notmuch new", and even
+ * then not if the directory was modified during the same second it
+ * was scanned.  Other programs (e.g., lieer or "notmuch insert") add
+ * and remove files without running notmuch new at all.  Hence, in
+ * addition to directories whose mtime changed, rescan any directory
+ * containing a file of a message modified since the last scan,
+ * according to notmuch's per-message lastmod value. */
+static void
+xapian_scan_lastmod (sqlite3 *sqldb, Xapian::Database &xdb)
+{
+  string ub = xdb.get_value_upper_bound(NOTMUCH_VALUE_LAST_MOD);
+  if (ub.empty())
+    return;
+  i64 lastmod = Xapian::sortable_unserialise(ub);
+
+  i64 oldlastmod = -1;
+  {
+    sqlstmt_t s(sqldb, "SELECT value FROM configuration"
+		" WHERE key = 'xapian_lastmod';");
+    if (s.step().row())
+      oldlastmod = s.integer(0);
+  }
+
+  // Scan all directories after an upgrade or a notmuch database rebuild.
+  if (oldlastmod < 0 || oldlastmod > lastmod)
+    sqlexec(sqldb, "INSERT OR IGNORE INTO modified_xapian_dirs"
+	    " SELECT dir_docid FROM xapian_dirs;");
+  else if (oldlastmod < lastmod) {
+    string prev = Xapian::sortable_serialise(oldlastmod);
+    sqlstmt_t flagdir(sqldb, "INSERT OR IGNORE INTO modified_xapian_dirs"
+		      " (dir_docid) VALUES (?);");
+    size_t prefixlen = notmuch_file_direntry_prefix.size();
+    for (Xapian::ValueIterator
+	   vi = xdb.valuestream_begin(NOTMUCH_VALUE_LAST_MOD),
+	   ve = xdb.valuestream_end(NOTMUCH_VALUE_LAST_MOD);
+	 vi != ve; ++vi) {
+      if (*vi <= prev)
+	continue;
+      Xapian::docid docid = vi.get_docid();
+      Xapian::TermIterator ti = xdb.termlist_begin(docid),
+	te = xdb.termlist_end(docid);
+      // File terms are XFDIRENTRY<dir_docid>:<name>.
+      for (ti.skip_to(notmuch_file_direntry_prefix);
+	   ti != te && !(*ti).compare(0, prefixlen,
+				      notmuch_file_direntry_prefix);
+	   ++ti)
+	flagdir.reset().param(i64(stoll((*ti).substr(prefixlen)))).step();
+    }
+  }
+  setconfig (sqldb, "xapian_lastmod", lastmod);
 }
 
 class fileops {
@@ -646,6 +708,8 @@ xapian_scan(sqlite3 *sqldb, writestamp ws, string maildir)
   print_time ("scanned tags");
   xapian_scan_directories (sqldb, xdb);
   print_time ("scanned directories in xapian");
+  xapian_scan_lastmod (sqldb, xdb);
+  print_time ("scanned modified messages in xapian");
   xapian_scan_filenames (sqldb, maildir, ws, xdb);
   print_time ("scanned filenames in xapian");
   xapian_adjust_nlinks(sqldb, ws);
